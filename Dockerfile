@@ -8,8 +8,6 @@ RUN npm ci --omit=dev || npm install --omit=dev
 
 COPY src/ ./src/
 
-RUN mkdir -p ./sessions
-
-EXPOSE 3001
+EXPOSE 3002
 
 CMD ["node", "src/index.js"]

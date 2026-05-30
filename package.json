@@ -9,10 +9,11 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.16",
+    "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "pg": "^8.21.0",
     "pino": "^9.6.0",
-    "qrcode": "^1.5.4",
-    "dotenv": "^16.4.7"
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "nodemon": "^3.1.9"

@@ -1,24 +1,29 @@
 const {
   default: makeWASocket,
-  useMultiFileAuthState,
   DisconnectReason,
   makeCacheableSignalKeyStore,
   fetchLatestBaileysVersion,
+  Browsers,
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
-const path = require("path");
-const fs = require("fs");
 const config = require("../config");
+const { getPool } = require("./database");
+const { usePgAuthState, deleteAuthData, hasAuthData, getAllTenantIds } = require("./pg-auth-state");
 
 const logger = pino({ level: config.logLevel });
 
-// In-memory store of active sessions: tenantId -> { socket, status, qr, retryCount }
+// Silent logger for Baileys internals — prevents massive log output from WA protocol events
+// (signal decryption, presence updates, history sync, etc.)
+const baileysLogger = pino({ level: "warn" });
+
+// In-memory store of active sessions: tenantId -> { socket, status, qr, retryCount, connectingStartedAt }
 const sessions = new Map();
 
-const MAX_RETRY = 3;
+const MAX_RETRY = 10;
 const QR_STALE_TIMEOUT_MS = 150000; // 150 seconds - auto-cleanup unscanned QR sessions
+const CONNECTING_STALE_TIMEOUT_MS = 120000; // 120 seconds - cleanup sessions stuck in connecting
 
-// Validate tenantId to prevent path traversal attacks (only allow alphanumeric + hyphens)
+// Validate tenantId to prevent injection attacks (only allow alphanumeric + hyphens)
 const TENANT_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
 
 function validateTenantId(tenantId) {
@@ -27,12 +32,14 @@ function validateTenantId(tenantId) {
   }
 }
 
-function getSessionDir(tenantId) {
-  validateTenantId(tenantId);
-  return path.join(config.sessionDir, tenantId);
-}
-
 async function startSession(tenantId) {
+  validateTenantId(tenantId);
+
+  // Preserve the original connecting-cycle start time across reconnect attempts so the
+  // stale-connecting watchdog can fire even when reconnects keep recreating the session.
+  let connectingStartedAt = Date.now();
+  let retryCount = 0;
+
   if (sessions.has(tenantId)) {
     const existing = sessions.get(tenantId);
     if (existing.status === "connected") {
@@ -41,7 +48,14 @@ async function startSession(tenantId) {
     if (existing.status === "connecting" || existing.status === "qr") {
       return { status: existing.status, qr: existing.qr };
     }
-    // Close old socket without deleting auth files (important for reconnect after pairing)
+    // Carry over the cycle start time and retry count when this is an automatic reconnect
+    if (existing.status === "reconnecting") {
+      if (existing.connectingStartedAt) {
+        connectingStartedAt = existing.connectingStartedAt;
+      }
+      retryCount = existing.retryCount || 0;
+    }
+    // Close old socket without deleting auth data (important for reconnect after pairing)
     try {
       if (existing.socket) {
         existing.socket.end();
@@ -52,21 +66,20 @@ async function startSession(tenantId) {
     sessions.delete(tenantId);
   }
 
-  const sessionDir = getSessionDir(tenantId);
-  fs.mkdirSync(sessionDir, { recursive: true });
-
   const sessionInfo = {
     socket: null,
     status: "connecting",
     qr: null,
-    retryCount: 0,
+    retryCount,
     qrCreatedAt: null,
+    connectingStartedAt,
     device: null,
   };
   sessions.set(tenantId, sessionInfo);
 
   try {
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    // Use PostgreSQL-backed auth state instead of file-based
+    const { state, saveCreds } = await usePgAuthState(tenantId);
 
     // Cache version to avoid slow GitHub API call on every session start
     let version;
@@ -75,7 +88,7 @@ async function startSession(tenantId) {
       version = result.version;
     } catch {
       // Fallback version if GitHub unreachable
-      version = [2, 3000, 1015901307];
+      version = [2, 3000, 1035194821];
       logger.warn({ tenant: tenantId }, "Using fallback WA version (GitHub unreachable)");
     }
 
@@ -83,9 +96,9 @@ async function startSession(tenantId) {
       version,
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
+        keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
       },
-      logger: logger.child({ tenant: tenantId }),
+      logger: baileysLogger,
       printQRInTerminal: false,
       generateHighQualityLinkPreview: false,
       markOnlineOnConnect: false,
@@ -94,7 +107,8 @@ async function startSession(tenantId) {
       connectTimeoutMs: 60000,
       qrTimeout: 60000,
       defaultQueryTimeoutMs: 60000,
-      browser: ["ISP Radius", "Chrome", "120.0.0"],
+      browser: Browsers.macOS("Desktop"),
+      keepAliveIntervalMs: 30000,
     });
 
     sessionInfo.socket = socket;
@@ -108,7 +122,12 @@ async function startSession(tenantId) {
         sessionInfo.qr = qr;
         sessionInfo.status = "qr";
         sessionInfo.qrCreatedAt = Date.now();
-        logger.info({ tenant: tenantId }, "QR code generated");
+        // QR was produced — clear the connecting watchdog timer. From here the QR-stale
+        // watchdog (qrCreatedAt) governs cleanup, and any brief connecting blip during
+        // pairing after the user scans must not be killed by the connecting watchdog.
+        sessionInfo.connectingStartedAt = null;
+        updateSessionStatus(tenantId, "qr");
+        logger.debug({ tenant: tenantId }, "QR code generated");
       }
 
       if (connection === "open") {
@@ -128,19 +147,26 @@ async function startSession(tenantId) {
             connectedAt: new Date().toISOString(),
           };
         }
+
+        // Update session status in DB
+        updateSessionStatus(tenantId, "connected", sessionInfo.device);
         logger.info({ tenant: tenantId, device: sessionInfo.device }, "WhatsApp connected");
       }
 
       if (connection === "close") {
-        const statusCode =
-          lastDisconnect?.error?.output?.statusCode;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const error = lastDisconnect?.error;
+        const errorMsg = error?.message || "Unknown error";
         const shouldReconnect =
           statusCode !== DisconnectReason.loggedOut && !sessionInfo.intentionallyClosed;
 
-        logger.warn(
-          { tenant: tenantId, statusCode },
-          "Connection closed"
-        );
+        // Only log unexpected disconnects (not loggedOut which is intentional, not 515 which is normal restart)
+        if (statusCode !== DisconnectReason.loggedOut && statusCode !== 515) {
+          logger.warn(
+            { tenant: tenantId, statusCode, error: errorMsg, stack: error?.stack },
+            "Connection closed"
+          );
+        }
 
         // 515 = stream restart after pairing — reconnect immediately, don't count as retry
         const isPairingRestart = statusCode === 515;
@@ -150,7 +176,14 @@ async function startSession(tenantId) {
             sessionInfo.retryCount++;
           }
           sessionInfo.status = "reconnecting";
-          const delay = isPairingRestart ? 1000 : 3000;
+          updateSessionStatus(tenantId, "reconnecting");
+          // Wait long enough that the debounced post-pairing creds save (250ms) has
+          // committed to PostgreSQL before the new socket re-reads them. Reading stale
+          // creds on a 515 pairing restart causes "scanned but never connects".
+          // Exponential backoff: 3s, 6s, 12s, ... capped at 60s. Pairing restart always 3s.
+          const delay = isPairingRestart
+            ? 3000
+            : Math.min(60000, 3000 * Math.pow(2, sessionInfo.retryCount - 1));
           logger.info(
             { tenant: tenantId, retry: sessionInfo.retryCount, isPairingRestart },
             "Reconnecting..."
@@ -159,13 +192,17 @@ async function startSession(tenantId) {
             startSession(tenantId).catch((err) => {
               logger.error({ tenant: tenantId, err: err.message }, "Reconnection failed");
               sessionInfo.status = "disconnected";
+              updateSessionStatus(tenantId, "disconnected");
             });
           }, delay);
         } else {
           sessionInfo.status = "disconnected";
+          updateSessionStatus(tenantId, "disconnected");
           if (statusCode === DisconnectReason.loggedOut) {
-            // Clean up session files if logged out
-            fs.rmSync(sessionDir, { recursive: true, force: true });
+            // Clean up auth data from database if logged out
+            deleteAuthData(tenantId).catch((err) => {
+              logger.error({ tenant: tenantId, err: err.message }, "Failed to cleanup auth data");
+            });
             sessions.delete(tenantId);
             logger.info({ tenant: tenantId }, "Session logged out and cleaned");
           }
@@ -207,8 +244,13 @@ async function stopSession(tenantId) {
     // Ignore end errors
   }
 
-  const sessionDir = getSessionDir(tenantId);
-  fs.rmSync(sessionDir, { recursive: true, force: true });
+  // Delete auth data from PostgreSQL
+  try {
+    await deleteAuthData(tenantId);
+  } catch (err) {
+    logger.error({ tenant: tenantId, err: err.message }, "Failed to delete auth data");
+  }
+
   sessions.delete(tenantId);
 
   return { status: "disconnected", message: "Session stopped and cleaned up" };
@@ -218,7 +260,7 @@ function getSession(tenantId) {
   return sessions.get(tenantId) || null;
 }
 
-function getStatus(tenantId) {
+async function getStatus(tenantId) {
   try {
     validateTenantId(tenantId);
   } catch {
@@ -227,9 +269,9 @@ function getStatus(tenantId) {
 
   const session = sessions.get(tenantId);
   if (!session) {
-    // Check if there's a stored session directory
-    const sessionDir = getSessionDir(tenantId);
-    if (fs.existsSync(sessionDir)) {
+    // Check if there's stored auth data in the database
+    const exists = await hasAuthData(tenantId);
+    if (exists) {
       return { status: "inactive", message: "Session exists but not started" };
     }
     return { status: "not_found", message: "No session found" };
@@ -260,7 +302,7 @@ async function sendMessage(tenantId, phone, message, options = {}) {
 
   // Enforce daily limit for all sends (including single messages)
   if (!options._skipLimitCheck) {
-    const todayCount = getTodaySendCount(tenantId);
+    const todayCount = await getTodaySendCount(tenantId);
     if (todayCount >= BROADCAST_CONFIG.DAILY_LIMIT_PER_TENANT) {
       throw new Error(`Daily send limit (${BROADCAST_CONFIG.DAILY_LIMIT_PER_TENANT}) reached for tenant ${tenantId}`);
     }
@@ -305,7 +347,7 @@ async function sendMessage(tenantId, phone, message, options = {}) {
 
   // Increment daily send count for single messages (broadcast handles its own counting)
   if (!options._skipLimitCheck) {
-    incrementSendCount(tenantId);
+    await incrementSendCount(tenantId);
   }
 
   return {
@@ -326,78 +368,13 @@ const BROADCAST_CONFIG = {
   DAILY_LIMIT_PER_TENANT: 500,    // Max messages per tenant per day
 };
 
-// Per-tenant daily send counter: tenantId -> { count, date }
-const dailySendCount = new Map();
-const DAILY_COUNT_FILE = path.join(config.sessionDir, ".daily-counts.json");
-
-let _saveCountsTimer = null;
-
-function loadDailyCounts() {
-  try {
-    if (fs.existsSync(DAILY_COUNT_FILE)) {
-      const data = JSON.parse(fs.readFileSync(DAILY_COUNT_FILE, "utf-8"));
-      const today = new Date().toISOString().slice(0, 10);
-      for (const [tenantId, record] of Object.entries(data)) {
-        if (record && record.date === today) {
-          dailySendCount.set(tenantId, record);
-        }
-      }
-      logger.info({ entries: dailySendCount.size }, "Loaded daily send counts from disk");
-    }
-  } catch (err) {
-    logger.warn({ err: err.message }, "Failed to load daily send counts");
-  }
-}
-
-function saveDailyCounts() {
-  try {
-    const data = {};
-    for (const [tenantId, record] of dailySendCount) {
-      data[tenantId] = record;
-    }
-    fs.mkdirSync(path.dirname(DAILY_COUNT_FILE), { recursive: true });
-    fs.writeFileSync(DAILY_COUNT_FILE, JSON.stringify(data, null, 2));
-  } catch (err) {
-    logger.warn({ err: err.message }, "Failed to save daily send counts");
-  }
-}
-
-function scheduleSaveCounts() {
-  if (_saveCountsTimer) return;
-  _saveCountsTimer = setTimeout(() => {
-    _saveCountsTimer = null;
-    saveDailyCounts();
-  }, 5000);
-}
-
-function getTodaySendCount(tenantId) {
-  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-  const record = dailySendCount.get(tenantId);
-  if (!record || record.date !== today) {
-    dailySendCount.set(tenantId, { count: 0, date: today });
-    return 0;
-  }
-  return record.count;
-}
-
-function incrementSendCount(tenantId, amount = 1) {
-  const today = new Date().toISOString().slice(0, 10);
-  const record = dailySendCount.get(tenantId);
-  if (!record || record.date !== today) {
-    dailySendCount.set(tenantId, { count: amount, date: today });
-  } else {
-    record.count += amount;
-  }
-  scheduleSaveCounts();
-}
-
 function randomDelay(minMs, maxMs) {
   return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
 }
 
 async function sendBroadcast(tenantId, phones, message, options = {}) {
   // Check daily limit
-  const todayCount = getTodaySendCount(tenantId);
+  const todayCount = await getTodaySendCount(tenantId);
   const remaining = BROADCAST_CONFIG.DAILY_LIMIT_PER_TENANT - todayCount;
 
   const results = { success: 0, failed: 0, pending: 0, pendingPhones: [], details: [] };
@@ -430,8 +407,8 @@ async function sendBroadcast(tenantId, phones, message, options = {}) {
   const shuffled = fisherYatesShuffle([...todayPhones]);
 
   logger.info(
-    { tenant: tenantId, total: shuffled.length, batchSize: BROADCAST_CONFIG.BATCH_SIZE },
-    "Starting anti-ban broadcast"
+    { tenant: tenantId, total: shuffled.length },
+    "Broadcast started"
   );
 
   for (let i = 0; i < shuffled.length; i++) {
@@ -447,7 +424,7 @@ async function sendBroadcast(tenantId, phones, message, options = {}) {
       });
       results.success++;
       results.details.push({ phone, ...result });
-      incrementSendCount(tenantId);
+      await incrementSendCount(tenantId);
     } catch (err) {
       results.failed++;
       results.details.push({ phone, status: "failed", error: err.message });
@@ -461,9 +438,9 @@ async function sendBroadcast(tenantId, phones, message, options = {}) {
           BROADCAST_CONFIG.BATCH_PAUSE_MIN_MS,
           BROADCAST_CONFIG.BATCH_PAUSE_MAX_MS
         );
-        logger.info(
-          { tenant: tenantId, batch: batchIndex + 1, pauseMs: batchPause, sent: i + 1, total: shuffled.length },
-          "Batch complete, pausing"
+        logger.debug(
+          { tenant: tenantId, batch: batchIndex + 1, sent: i + 1, total: shuffled.length },
+          "Batch paused"
         );
         await sleep(batchPause);
       } else {
@@ -479,7 +456,7 @@ async function sendBroadcast(tenantId, phones, message, options = {}) {
 
   logger.info(
     { tenant: tenantId, success: results.success, failed: results.failed, pending: results.pending },
-    "Broadcast batch complete"
+    "Broadcast complete"
   );
 
   return results;
@@ -489,7 +466,7 @@ async function sendBroadcast(tenantId, phones, message, options = {}) {
 // Enforces daily limits, batch pauses, and typing simulation just like sendBroadcast.
 async function sendReminderBroadcast(tenantId, phones, phoneMessageMap) {
   // Check daily limit
-  const todayCount = getTodaySendCount(tenantId);
+  const todayCount = await getTodaySendCount(tenantId);
   const remaining = BROADCAST_CONFIG.DAILY_LIMIT_PER_TENANT - todayCount;
 
   const results = { success: 0, failed: 0, pending: 0, pendingPhones: [], details: [] };
@@ -518,7 +495,7 @@ async function sendReminderBroadcast(tenantId, phones, phoneMessageMap) {
 
   logger.info(
     { tenant: tenantId, total: shuffled.length, type: "reminder" },
-    "Starting anti-ban reminder broadcast"
+    "Reminder broadcast started"
   );
 
   for (let i = 0; i < shuffled.length; i++) {
@@ -539,7 +516,7 @@ async function sendReminderBroadcast(tenantId, phones, phoneMessageMap) {
       });
       results.success++;
       results.details.push({ phone, ...result });
-      incrementSendCount(tenantId);
+      await incrementSendCount(tenantId);
     } catch (err) {
       results.failed++;
       results.details.push({ phone, status: "failed", error: err.message });
@@ -569,6 +546,71 @@ async function sendReminderBroadcast(tenantId, phones, phoneMessageMap) {
   );
 
   return results;
+}
+
+// ─── Database-backed daily send counter ───
+
+/**
+ * Get today's send count for a tenant from PostgreSQL.
+ */
+async function getTodaySendCount(tenantId) {
+  const pool = getPool();
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+  const result = await pool.query(
+    "SELECT send_count FROM wa_daily_counts WHERE tenant_id = $1 AND count_date = $2",
+    [tenantId, today]
+  );
+
+  if (result.rows.length === 0) {
+    return 0;
+  }
+  return result.rows[0].send_count;
+}
+
+/**
+ * Increment daily send count for a tenant in PostgreSQL (atomic upsert).
+ */
+async function incrementSendCount(tenantId, amount = 1) {
+  const pool = getPool();
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+  await pool.query(
+    `INSERT INTO wa_daily_counts (tenant_id, count_date, send_count)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (tenant_id, count_date)
+     DO UPDATE SET send_count = wa_daily_counts.send_count + $3`,
+    [tenantId, today, amount]
+  );
+}
+
+/**
+ * Update session status in the database.
+ */
+async function updateSessionStatus(tenantId, status, device = null) {
+  try {
+    const pool = getPool();
+
+    if (device) {
+      await pool.query(
+        `INSERT INTO wa_session_status (tenant_id, status, device_phone, device_name, device_platform, connected_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+         ON CONFLICT (tenant_id)
+         DO UPDATE SET status = $2, device_phone = $3, device_name = $4, device_platform = $5, connected_at = NOW(), updated_at = NOW()`,
+        [tenantId, status, device.phone || null, device.name || null, device.platform || null]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO wa_session_status (tenant_id, status, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (tenant_id)
+         DO UPDATE SET status = $2, updated_at = NOW()`,
+        [tenantId, status]
+      );
+    }
+  } catch (err) {
+    logger.error({ tenant: tenantId, err: err.message }, "Failed to update session status in DB");
+  }
 }
 
 function validateMediaUrl(url) {
@@ -623,41 +665,37 @@ function fisherYatesShuffle(arr) {
   return arr;
 }
 
-// Restore sessions from disk on startup
+// Restore sessions from database on startup
 async function restoreSessions() {
-  if (!fs.existsSync(config.sessionDir)) {
-    fs.mkdirSync(config.sessionDir, { recursive: true });
-    return;
-  }
+  try {
+    const tenantIds = await getAllTenantIds();
 
-  loadDailyCounts();
+    logger.info({ count: tenantIds.length }, "Restoring saved sessions from PostgreSQL");
 
-  const dirs = fs
-    .readdirSync(config.sessionDir, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
-    .map((d) => d.name);
-
-  logger.info({ count: dirs.length }, "Restoring saved sessions");
-
-  for (const tenantId of dirs) {
-    try {
-      await startSession(tenantId);
-      logger.info({ tenant: tenantId }, "Session restored");
-    } catch (err) {
-      logger.error(
-        { tenant: tenantId, err: err.message },
-        "Failed to restore session"
-      );
+    for (const tenantId of tenantIds) {
+      try {
+        await startSession(tenantId);
+        logger.debug({ tenant: tenantId }, "Session restored");
+      } catch (err) {
+        logger.error(
+          { tenant: tenantId, err: err.message },
+          "Failed to restore session"
+        );
+      }
+      // Delay between session restorations to avoid triggering WA anti-ban
+      if (tenantIds.length > 1) {
+        await sleep(3000);
+      }
     }
-    // Delay between session restorations to avoid triggering WA anti-ban
-    if (dirs.length > 1) {
-      await sleep(3000);
-    }
+  } catch (err) {
+    logger.error({ err: err.message }, "Failed to restore sessions from database");
   }
 }
 
-// Periodic cleanup of stale QR sessions (per-tenant)
-// If a tenant's QR is not scanned within QR_STALE_TIMEOUT_MS, the session is stopped
+// Periodic cleanup of stale sessions (per-tenant)
+// - QR sessions not scanned within QR_STALE_TIMEOUT_MS are stopped
+// - Sessions stuck in "connecting" longer than CONNECTING_STALE_TIMEOUT_MS are stopped
+//   (this handles the case where saved credentials are expired/invalid and Baileys can't reconnect)
 let staleCleanupRunning = false;
 const staleCleanupInterval = setInterval(async () => {
   if (staleCleanupRunning) return; // Prevent concurrent cleanup runs
@@ -677,7 +715,24 @@ const staleCleanupInterval = setInterval(async () => {
         try {
           await stopSession(tenantId);
         } catch (err) {
-          logger.error({ tenant: tenantId, err: err.message }, "Failed to cleanup stale session");
+          logger.error({ tenant: tenantId, err: err.message }, "Failed to cleanup stale QR session");
+        }
+      } else if (
+        (session.status === "connecting" || session.status === "reconnecting") &&
+        session.connectingStartedAt &&
+        now - session.connectingStartedAt > CONNECTING_STALE_TIMEOUT_MS
+      ) {
+        // Session has been connecting/reconnecting too long without producing a QR — saved
+        // credentials are likely expired and Baileys can't pair. Stop the session (which clears
+        // the bad auth data) so the user can start fresh and get a new QR.
+        logger.info(
+          { tenant: tenantId, status: session.status, staleSec: Math.round((now - session.connectingStartedAt) / 1000) },
+          "Cleaning up stale connecting/reconnecting session (no QR produced, credentials may be expired)"
+        );
+        try {
+          await stopSession(tenantId);
+        } catch (err) {
+          logger.error({ tenant: tenantId, err: err.message }, "Failed to cleanup stale connecting session");
         }
       }
     }
@@ -689,8 +744,6 @@ const staleCleanupInterval = setInterval(async () => {
 // Gracefully close all active Baileys sockets (called on SIGTERM/SIGINT)
 async function gracefulShutdown() {
   clearInterval(staleCleanupInterval);
-  if (_saveCountsTimer) clearTimeout(_saveCountsTimer);
-  saveDailyCounts();
   const tenantIds = [...sessions.keys()];
   logger.info({ count: tenantIds.length }, "Gracefully closing all sessions");
   for (const tenantId of tenantIds) {

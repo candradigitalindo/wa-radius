@@ -4,6 +4,7 @@ const config = require("./config");
 const authMiddleware = require("./middleware/auth");
 const sessionRoutes = require("./routes/session");
 const messageRoutes = require("./routes/message");
+const { initDatabase, closeDatabase } = require("./services/database");
 const { restoreSessions, gracefulShutdown } = require("./services/session-manager");
 
 const logger = pino({ level: config.logLevel });
@@ -12,8 +13,15 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 // Health check (no auth required)
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", service: "whatsapp-service" });
+app.get("/health", async (_req, res) => {
+  try {
+    const { getPool } = require("./services/database");
+    const pool = getPool();
+    await pool.query("SELECT 1");
+    res.json({ status: "ok", service: "whatsapp-service", database: "connected" });
+  } catch {
+    res.status(503).json({ status: "degraded", service: "whatsapp-service", database: "disconnected" });
+  }
 });
 
 // All API routes require auth
@@ -34,17 +42,21 @@ async function main() {
     process.exit(1);
   }
 
-  // Restore existing sessions on startup
+  // Initialize PostgreSQL connection and auto-create tables
+  await initDatabase();
+
+  // Restore existing sessions from database on startup
   await restoreSessions();
 
   const server = app.listen(config.port, () => {
     logger.info({ port: config.port, env: config.nodeEnv }, "WhatsApp service started");
   });
 
-  // Graceful shutdown: close all Baileys sockets cleanly before exit
+  // Graceful shutdown: close all Baileys sockets + DB cleanly before exit
   const shutdown = async (signal) => {
     logger.info({ signal }, "Shutdown signal received, closing sessions...");
     await gracefulShutdown();
+    await closeDatabase();
     server.close(() => {
       logger.info("HTTP server closed");
       process.exit(0);

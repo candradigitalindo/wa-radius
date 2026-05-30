@@ -16,10 +16,10 @@ router.post("/:tenantId/start", async (req, res) => {
 });
 
 // Get session status
-router.get("/:tenantId/status", (req, res) => {
+router.get("/:tenantId/status", async (req, res) => {
   try {
     const { tenantId } = req.params;
-    const status = sessionManager.getStatus(tenantId);
+    const status = await sessionManager.getStatus(tenantId);
     res.json(status);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -30,7 +30,7 @@ router.get("/:tenantId/status", (req, res) => {
 router.get("/:tenantId/qr", async (req, res) => {
   try {
     const { tenantId } = req.params;
-    const status = sessionManager.getStatus(tenantId);
+    const status = await sessionManager.getStatus(tenantId);
 
     if (!status.qr) {
       // Return 200 with current status so caller can detect connected/disconnected
@@ -41,7 +41,11 @@ router.get("/:tenantId/qr", async (req, res) => {
       });
     }
 
-    const qrImage = await qrcode.toDataURL(status.qr);
+    const qrImage = await qrcode.toDataURL(status.qr, {
+      margin: 2,
+      scale: 4,
+      errorCorrectionLevel: 'H'
+    });
     res.json({ qr: qrImage, status: status.status });
   } catch (err) {
     res.status(500).json({ error: err.message });
