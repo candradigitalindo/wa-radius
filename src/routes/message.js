@@ -77,10 +77,11 @@ router.post("/reminder", async (req, res) => {
     // Pre-process: format messages and collect valid phones
     const validPhones = [];
     const phoneMessageMap = new Map();
+    const phoneCtaMap = new Map();
     const skipped = [];
 
     for (const reminder of reminders) {
-      const { phone, customerName, invoiceNumber, amount, dueDate, message } =
+      const { phone, customerName, invoiceNumber, amount, dueDate, message, ctaButton } =
         reminder;
 
       if (!phone || !message) {
@@ -104,6 +105,14 @@ router.post("/reminder", async (req, res) => {
 
       validPhones.push(phoneStr);
       phoneMessageMap.set(phoneStr, formattedMessage);
+
+      // Attach CTA button (e.g. "Bayar Online" → payment gateway URL)
+      if (ctaButton && ctaButton.url) {
+        phoneCtaMap.set(phoneStr, {
+          text: ctaButton.text || "Bayar Online",
+          url: ctaButton.url,
+        });
+      }
     }
 
     // Deduplicate: phoneMessageMap already keeps last message per phone,
@@ -125,7 +134,8 @@ router.post("/reminder", async (req, res) => {
     const results = await sessionManager.sendReminderBroadcast(
       tenantId,
       uniquePhones,
-      phoneMessageMap
+      phoneMessageMap,
+      phoneCtaMap
     );
 
     // Merge skipped items into results

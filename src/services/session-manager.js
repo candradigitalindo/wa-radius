@@ -23,6 +23,27 @@ const MAX_RETRY = 10;
 const QR_STALE_TIMEOUT_MS = 150000; // 150 seconds - auto-cleanup unscanned QR sessions
 const CONNECTING_STALE_TIMEOUT_MS = 120000; // 120 seconds - cleanup sessions stuck in connecting
 
+// Cache WA version at process level — avoids GitHub API call on every session start
+let _cachedWAVersion = null;
+let _versionCachedAt = 0;
+const VERSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+async function getWAVersion() {
+  const now = Date.now();
+  if (_cachedWAVersion && (now - _versionCachedAt) < VERSION_CACHE_TTL_MS) {
+    return _cachedWAVersion;
+  }
+  try {
+    const result = await fetchLatestBaileysVersion();
+    _cachedWAVersion = result.version;
+    _versionCachedAt = now;
+    return _cachedWAVersion;
+  } catch {
+    logger.warn("Using fallback WA version (GitHub unreachable)");
+    return [2, 3000, 1035194821];
+  }
+}
+
 // Validate tenantId to prevent injection attacks (only allow alphanumeric + hyphens)
 const TENANT_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
 
@@ -81,16 +102,7 @@ async function startSession(tenantId) {
     // Use PostgreSQL-backed auth state instead of file-based
     const { state, saveCreds } = await usePgAuthState(tenantId);
 
-    // Cache version to avoid slow GitHub API call on every session start
-    let version;
-    try {
-      const result = await fetchLatestBaileysVersion();
-      version = result.version;
-    } catch {
-      // Fallback version if GitHub unreachable
-      version = [2, 3000, 1035194821];
-      logger.warn({ tenant: tenantId }, "Using fallback WA version (GitHub unreachable)");
-    }
+    const version = await getWAVersion();
 
     const socket = makeWASocket({
       version,
@@ -157,8 +169,17 @@ async function startSession(tenantId) {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const error = lastDisconnect?.error;
         const errorMsg = error?.message || "Unknown error";
-        const shouldReconnect =
-          statusCode !== DisconnectReason.loggedOut && !sessionInfo.intentionallyClosed;
+
+        // Codes that must NEVER trigger reconnect — retrying makes the situation worse
+        // 401 = loggedOut (user logged out from phone)
+        // 403 = forbidden (account banned by WhatsApp)
+        // 500 = badSession (corrupted session, reconnecting won't help)
+        const isFatalDisconnect =
+          statusCode === DisconnectReason.loggedOut ||   // 401
+          statusCode === DisconnectReason.forbidden ||   // 403 — BANNED
+          statusCode === DisconnectReason.badSession;    // 500
+
+        const shouldReconnect = !isFatalDisconnect && !sessionInfo.intentionallyClosed;
 
         // Only log unexpected disconnects (not loggedOut which is intentional, not 515 which is normal restart)
         if (statusCode !== DisconnectReason.loggedOut && statusCode !== 515) {
@@ -196,15 +217,26 @@ async function startSession(tenantId) {
             });
           }, delay);
         } else {
-          sessionInfo.status = "disconnected";
-          updateSessionStatus(tenantId, "disconnected");
-          if (statusCode === DisconnectReason.loggedOut) {
-            // Clean up auth data from database if logged out
+          // Fatal disconnect or max retries reached
+          const isBanned = statusCode === DisconnectReason.forbidden;
+          const finalStatus = isBanned ? "banned" : "disconnected";
+
+          sessionInfo.status = finalStatus;
+          updateSessionStatus(tenantId, finalStatus);
+
+          if (isBanned) {
+            logger.warn({ tenant: tenantId }, "Account banned by WhatsApp — cleaning up session");
+          }
+
+          // Clean up auth data for fatal disconnects (ban, logout, bad session)
+          if (isFatalDisconnect) {
             deleteAuthData(tenantId).catch((err) => {
               logger.error({ tenant: tenantId, err: err.message }, "Failed to cleanup auth data");
             });
             sessions.delete(tenantId);
-            logger.info({ tenant: tenantId }, "Session logged out and cleaned");
+            if (statusCode === DisconnectReason.loggedOut) {
+              logger.info({ tenant: tenantId }, "Session logged out and cleaned");
+            }
           }
         }
       }
@@ -295,16 +327,31 @@ function listSessions() {
 }
 
 async function sendMessage(tenantId, phone, message, options = {}) {
-  const session = sessions.get(tenantId);
+  let session = sessions.get(tenantId);
+  let effectiveTenantId = tenantId;
+
+  // If tenant's own session isn't connected, fall back to superadmin session.
+  if ((!session || session.status !== "connected" || !session.socket) && tenantId !== "superadmin") {
+    const superadminSession = sessions.get("superadmin");
+    if (superadminSession && superadminSession.status === "connected" && superadminSession.socket) {
+      logger.warn(
+        { tenant: tenantId, fallback: "superadmin" },
+        "Tenant WA session not connected, falling back to superadmin"
+      );
+      session = superadminSession;
+      effectiveTenantId = "superadmin";
+    }
+  }
+
   if (!session || session.status !== "connected" || !session.socket) {
     throw new Error(`WhatsApp session not connected for tenant ${tenantId}`);
   }
 
-  // Enforce daily limit for all sends (including single messages)
+  // Enforce daily limit against the effective (actual) sending session
   if (!options._skipLimitCheck) {
-    const todayCount = await getTodaySendCount(tenantId);
+    const todayCount = await getTodaySendCount(effectiveTenantId);
     if (todayCount >= BROADCAST_CONFIG.DAILY_LIMIT_PER_TENANT) {
-      throw new Error(`Daily send limit (${BROADCAST_CONFIG.DAILY_LIMIT_PER_TENANT}) reached for tenant ${tenantId}`);
+      throw new Error(`Daily send limit (${BROADCAST_CONFIG.DAILY_LIMIT_PER_TENANT}) reached for tenant ${effectiveTenantId}`);
     }
   }
 
@@ -347,7 +394,7 @@ async function sendMessage(tenantId, phone, message, options = {}) {
 
   // Increment daily send count for single messages (broadcast handles its own counting)
   if (!options._skipLimitCheck) {
-    await incrementSendCount(tenantId);
+    await incrementSendCount(effectiveTenantId);
   }
 
   return {
@@ -366,7 +413,25 @@ const BROADCAST_CONFIG = {
   BATCH_PAUSE_MIN_MS: 15000,      // Min pause between batches (15s)
   BATCH_PAUSE_MAX_MS: 30000,      // Max pause between batches (30s)
   DAILY_LIMIT_PER_TENANT: 500,    // Max messages per tenant per day
+  MAX_CONCURRENT_SENDERS: 3,      // Max tenants sending simultaneously (IP reputation)
 };
+
+// ─── Global concurrent send semaphore ───
+// Prevents too many tenants blasting messages at the same time from the same IP.
+// If tenant A (spam) triggers IP-level WA throttling, it could affect tenants B & C.
+// Limiting concurrent senders reduces aggregate throughput from this IP.
+let _activeSenders = 0;
+
+async function acquireSendSlot() {
+  while (_activeSenders >= BROADCAST_CONFIG.MAX_CONCURRENT_SENDERS) {
+    await sleep(2000);
+  }
+  _activeSenders++;
+}
+
+function releaseSendSlot() {
+  if (_activeSenders > 0) _activeSenders--;
+}
 
 function randomDelay(minMs, maxMs) {
   return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
@@ -376,6 +441,7 @@ async function sendBroadcast(tenantId, phones, message, options = {}) {
   // Check daily limit
   const todayCount = await getTodaySendCount(tenantId);
   const remaining = BROADCAST_CONFIG.DAILY_LIMIT_PER_TENANT - todayCount;
+  await acquireSendSlot();
 
   const results = { success: 0, failed: 0, pending: 0, pendingPhones: [], details: [] };
 
@@ -387,6 +453,7 @@ async function sendBroadcast(tenantId, phones, message, options = {}) {
       { tenant: tenantId, pending: phones.length },
       "Daily limit reached, all phones queued for tomorrow"
     );
+    releaseSendSlot();
     return results;
   }
 
@@ -459,15 +526,17 @@ async function sendBroadcast(tenantId, phones, message, options = {}) {
     "Broadcast complete"
   );
 
+  releaseSendSlot();
   return results;
 }
 
 // Send reminders with anti-ban protection (each phone has a unique message)
 // Enforces daily limits, batch pauses, and typing simulation just like sendBroadcast.
-async function sendReminderBroadcast(tenantId, phones, phoneMessageMap) {
+async function sendReminderBroadcast(tenantId, phones, phoneMessageMap, phoneCtaMap = new Map()) {
   // Check daily limit
   const todayCount = await getTodaySendCount(tenantId);
   const remaining = BROADCAST_CONFIG.DAILY_LIMIT_PER_TENANT - todayCount;
+  await acquireSendSlot();
 
   const results = { success: 0, failed: 0, pending: 0, pendingPhones: [], details: [] };
 
@@ -478,6 +547,7 @@ async function sendReminderBroadcast(tenantId, phones, phoneMessageMap) {
       { tenant: tenantId, pending: phones.length },
       "Daily limit reached for reminders, all queued"
     );
+    releaseSendSlot();
     return results;
   }
 
@@ -510,9 +580,11 @@ async function sendReminderBroadcast(tenantId, phones, phoneMessageMap) {
     }
 
     try {
+      const ctaButton = phoneCtaMap.get(phone) || null;
       const result = await sendMessage(tenantId, phone, message, {
         simulateTyping: true,
         _skipLimitCheck: true,
+        ctaButton,
       });
       results.success++;
       results.details.push({ phone, ...result });
@@ -545,6 +617,7 @@ async function sendReminderBroadcast(tenantId, phones, phoneMessageMap) {
     "Reminder broadcast complete"
   );
 
+  releaseSendSlot();
   return results;
 }
 
