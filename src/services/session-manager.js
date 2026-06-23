@@ -28,6 +28,58 @@ let _cachedWAVersion = null;
 let _versionCachedAt = 0;
 const VERSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
+// Pull plain text out of the many WhatsApp message shapes.
+function extractText(message) {
+  if (!message) return "";
+  return (
+    message.conversation ||
+    message.extendedTextMessage?.text ||
+    message.imageMessage?.caption ||
+    message.videoMessage?.caption ||
+    message.documentMessage?.caption ||
+    message.buttonsResponseMessage?.selectedDisplayText ||
+    message.listResponseMessage?.title ||
+    ""
+  );
+}
+
+// Forward one incoming message to the n8n webhook (fire-and-forget).
+async function forwardToN8n(tenantId, msg) {
+  try {
+    const jid = msg.key?.remoteJid || "";
+    // Skip own messages, status broadcasts, and groups (CS is 1:1 with tenants).
+    if (msg.key?.fromMe) return;
+    if (jid === "status@broadcast" || jid.endsWith("@g.us")) return;
+
+    const text = extractText(msg.message).trim();
+    if (!text) return; // ignore media-only / reactions / system events
+
+    const phone = jid.split("@")[0].split(":")[0];
+    const payload = {
+      tenantId,
+      from: jid,
+      phone,
+      name: msg.pushName || "",
+      message: text,
+      messageId: msg.key?.id || "",
+      timestamp: msg.messageTimestamp ? Number(msg.messageTimestamp) : Math.floor(Date.now() / 1000),
+    };
+
+    const res = await fetch(config.n8nWebhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      logger.warn({ tenant: tenantId, status: res.status }, "n8n webhook returned non-2xx");
+    } else {
+      logger.debug({ tenant: tenantId, phone }, "forwarded incoming message to n8n");
+    }
+  } catch (err) {
+    logger.warn({ tenant: tenantId, err: err.message }, "failed to forward message to n8n");
+  }
+}
+
 async function getWAVersion() {
   const now = Date.now();
   if (_cachedWAVersion && (now - _versionCachedAt) < VERSION_CACHE_TTL_MS) {
@@ -126,6 +178,17 @@ async function startSession(tenantId) {
     sessionInfo.socket = socket;
 
     socket.ev.on("creds.update", saveCreds);
+
+    // Forward incoming messages to n8n (CS bot) — only for whitelisted sessions
+    // (default: superadmin), so this serves tenants, never tenant↔customer chats.
+    if (config.n8nWebhookUrl && config.n8nWebhookTenants.includes(tenantId)) {
+      socket.ev.on("messages.upsert", (ev) => {
+        if (ev.type !== "notify") return;
+        for (const msg of ev.messages || []) {
+          forwardToN8n(tenantId, msg);
+        }
+      });
+    }
 
     socket.ev.on("connection.update", (update) => {
       const { connection, lastDisconnect, qr } = update;
