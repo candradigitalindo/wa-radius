@@ -456,6 +456,10 @@ async function sendMessage(tenantId, phone, message, options = {}) {
   // Normalize phone number to WhatsApp JID
   const jid = normalizeJid(phone);
 
+  // Convert Markdown emphasis (e.g. AI replies often emit **bold**) into WhatsApp's
+  // single-asterisk syntax so bold actually renders instead of showing literal asterisks.
+  message = toWhatsAppMarkup(message);
+
   const messageContent = {};
 
   if (options.image) validateMediaUrl(options.image);
@@ -795,6 +799,25 @@ function validateMediaUrl(url) {
     if (err.message.includes("Only http")) throw err;
     throw new Error("Invalid media URL format");
   }
+}
+
+// Convert common Markdown emphasis to WhatsApp formatting.
+// WhatsApp bold is a SINGLE asterisk (*bold*); Markdown's **bold** / __bold__ and
+// `#` headings render as literal characters on WhatsApp. LLM replies frequently emit
+// Markdown, so we normalize before sending. Single-asterisk text (already correct,
+// e.g. billing templates "*Rp199.000*") is left untouched.
+function toWhatsAppMarkup(text) {
+  if (!text || typeof text !== "string") return text;
+  let t = text;
+  // `#`..`######` headings at line start → bold line
+  t = t.replace(/^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$/gm, "*$1*");
+  // ***bold italic*** → *bold* (WhatsApp has no triple-marker syntax) — must run before **
+  t = t.replace(/\*\*\*(.+?)\*\*\*/g, "*$1*");
+  // **bold** → *bold*
+  t = t.replace(/\*\*(.+?)\*\*/g, "*$1*");
+  // __bold__ → *bold*
+  t = t.replace(/__(.+?)__/g, "*$1*");
+  return t;
 }
 
 function normalizeJid(phone) {
