@@ -68,11 +68,22 @@ async function forwardToN8n(tenantId, msg) {
       return;
     }
 
-    const phone = jid.split("@")[0].split(":")[0];
+    // WhatsApp may address senders by a privacy LID ("…@lid") instead of the real
+    // phone JID. For tenant lookup we need the real phone number (PN): prefer the
+    // PN fields Baileys exposes; fall back to the raw JID digits.
+    const pnSource =
+      msg.key?.senderPn ||
+      msg.key?.participantPn ||
+      (typeof msg.key?.remoteJidAlt === "string" && msg.key.remoteJidAlt.includes("@s.whatsapp.net")
+        ? msg.key.remoteJidAlt
+        : "") ||
+      (jid.endsWith("@s.whatsapp.net") ? jid : "");
+    const phone = (pnSource || jid).split("@")[0].split(":")[0];
+
     const payload = {
       tenantId,
-      from: jid,
-      phone,
+      from: jid, // full JID (may be @lid) — reply target, send to it verbatim
+      phone, // resolved phone number for tenant lookup
       name: msg.pushName || "",
       message: text,
       messageId: msg.key?.id || "",
@@ -779,6 +790,12 @@ function validateMediaUrl(url) {
 function normalizeJid(phone) {
   if (!phone || typeof phone !== "string") {
     throw new Error("Phone number is required and must be a string");
+  }
+
+  // Already a full WhatsApp JID (e.g. "62xxx@s.whatsapp.net" or "148...@lid") —
+  // send to it verbatim. Lets us reply to @lid senders (WhatsApp privacy IDs).
+  if (phone.includes("@")) {
+    return phone;
   }
 
   // Remove non-digit characters
