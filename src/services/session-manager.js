@@ -54,6 +54,20 @@ async function forwardToN8n(tenantId, msg) {
     const text = extractText(msg.message).trim();
     if (!text) return; // ignore media-only / reactions / system events
 
+    // Skip trivial acknowledgements/emoji-only so they don't trigger an (paid)
+    // AI reply. Normalize: lowercase, strip punctuation/emoji/spaces.
+    const norm = text.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const TRIVIAL = new Set([
+      "ok", "oke", "okay", "okegan", "okekak", "okesip", "siap", "sip", "ya", "iya",
+      "yah", "yaudah", "y", "yh", "makasih", "makasi", "mksh", "thanks", "thx", "tq",
+      "terimakasih", "trimakasih", "trimakasi", "noted", "mantap", "mantul", "good",
+      "baik", "oks", "okok", "yo", "yoi",
+    ]);
+    if (norm.length === 0 || norm.length <= 2 || TRIVIAL.has(norm)) {
+      logger.debug({ tenant: tenantId }, "skipped trivial message (no AI call)");
+      return;
+    }
+
     const phone = jid.split("@")[0].split(":")[0];
     const payload = {
       tenantId,
