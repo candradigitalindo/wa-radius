@@ -235,6 +235,11 @@ async function startSession(tenantId) {
         sessionInfo.qr = null;
         sessionInfo.qrCreatedAt = null;
         sessionInfo.retryCount = 0;
+        // Clear the connecting-cycle start time so a later brief disconnect/reconnect on a
+        // long-lived session is NOT mistaken for a stuck "connecting" session by the stale
+        // watchdog (which would otherwise wipe valid credentials). Once we've opened, the
+        // connecting watchdog no longer governs this session.
+        sessionInfo.connectingStartedAt = null;
 
         // Extract device info from socket
         const me = socket.user;
@@ -258,14 +263,18 @@ async function startSession(tenantId) {
         const error = lastDisconnect?.error;
         const errorMsg = error?.message || "Unknown error";
 
-        // Codes that must NEVER trigger reconnect — retrying makes the situation worse
-        // 401 = loggedOut (user logged out from phone)
+        // Codes that must NEVER trigger reconnect AND justify wiping credentials — these
+        // mean the link itself is gone and only a fresh QR scan can recover it:
+        // 401 = loggedOut (user removed the linked device from their phone)
         // 403 = forbidden (account banned by WhatsApp)
-        // 500 = badSession (corrupted session, reconnecting won't help)
+        // NOTE: 500 (badSession) is intentionally NOT fatal here. WhatsApp also emits a
+        // statusCode 500 for transient "stream:error (ack)" events on a perfectly valid
+        // session; treating every 500 as a corrupted session wiped good credentials and
+        // forced needless re-scans. We now reconnect on 500 (capped by MAX_RETRY) and keep
+        // the credentials. If the session were truly bad, reconnect simply fails the cap.
         const isFatalDisconnect =
           statusCode === DisconnectReason.loggedOut ||   // 401
-          statusCode === DisconnectReason.forbidden ||   // 403 — BANNED
-          statusCode === DisconnectReason.badSession;    // 500
+          statusCode === DisconnectReason.forbidden;     // 403 — BANNED
 
         const shouldReconnect = !isFatalDisconnect && !sessionInfo.intentionallyClosed;
 
@@ -316,7 +325,8 @@ async function startSession(tenantId) {
             logger.warn({ tenant: tenantId }, "Account banned by WhatsApp — cleaning up session");
           }
 
-          // Clean up auth data for fatal disconnects (ban, logout, bad session)
+          // Clean up auth data only for fatal disconnects (logout / ban). Max-retry
+          // exhaustion keeps the credentials so a later restart can reuse them.
           if (isFatalDisconnect) {
             deleteAuthData(tenantId).catch((err) => {
               logger.error({ tenant: tenantId, err: err.message }, "Failed to cleanup auth data");
@@ -889,17 +899,25 @@ const staleCleanupInterval = setInterval(async () => {
         session.connectingStartedAt &&
         now - session.connectingStartedAt > CONNECTING_STALE_TIMEOUT_MS
       ) {
-        // Session has been connecting/reconnecting too long without producing a QR — saved
-        // credentials are likely expired and Baileys can't pair. Stop the session (which clears
-        // the bad auth data) so the user can start fresh and get a new QR.
+        // Session has been connecting/reconnecting too long. Close the socket and mark it
+        // disconnected, but do NOT delete the credentials: a transient outage must not force
+        // the tenant to re-scan a QR. The credentials are kept so the next startSession (manual
+        // or restore on restart) can reuse them. Only genuine loggedOut/forbidden disconnects
+        // (handled in connection.update) are allowed to wipe auth data.
         logger.info(
           { tenant: tenantId, status: session.status, staleSec: Math.round((now - session.connectingStartedAt) / 1000) },
-          "Cleaning up stale connecting/reconnecting session (no QR produced, credentials may be expired)"
+          "Closing stale connecting/reconnecting session (keeping credentials)"
         );
         try {
-          await stopSession(tenantId);
+          session.intentionallyClosed = true; // prevent the close handler from auto-reconnecting
+          if (session.socket) {
+            session.socket.end();
+          }
+          session.status = "disconnected";
+          await updateSessionStatus(tenantId, "disconnected");
+          sessions.delete(tenantId);
         } catch (err) {
-          logger.error({ tenant: tenantId, err: err.message }, "Failed to cleanup stale connecting session");
+          logger.error({ tenant: tenantId, err: err.message }, "Failed to close stale connecting session");
         }
       }
     }
