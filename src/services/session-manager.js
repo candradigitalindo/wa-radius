@@ -809,6 +809,7 @@ function validateMediaUrl(url) {
 function toWhatsAppMarkup(text) {
   if (!text || typeof text !== "string") return text;
   let t = text;
+  // ── Emphasis: convert Markdown to WhatsApp's single-asterisk bold ──
   // `#`..`######` headings at line start → bold line
   t = t.replace(/^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$/gm, "*$1*");
   // ***bold italic*** → *bold* (WhatsApp has no triple-marker syntax) — must run before **
@@ -817,7 +818,39 @@ function toWhatsAppMarkup(text) {
   t = t.replace(/\*\*(.+?)\*\*/g, "*$1*");
   // __bold__ → *bold*
   t = t.replace(/__(.+?)__/g, "*$1*");
-  return t;
+
+  // ── Structure: tidy, compact lists for WhatsApp ──
+  // Classify each line, stripping Markdown indentation (which renders as ragged
+  // leading spaces on WhatsApp) and unifying bullet markers to "- ".
+  const parsed = t.split("\n").map((line) => {
+    const bullet = line.match(/^[ \t]*[-*+][ \t]+(.*)$/); // "- ", "* ", "+ " (needs space → won't catch *bold*)
+    if (bullet) return { type: "bullet", text: "- " + bullet[1].trim() };
+    const num = line.match(/^[ \t]*(\d+)\.[ \t]+(.*)$/); // "1. ", "2. " …
+    if (num) return { type: "num", text: num[1] + ". " + num[2].trim() };
+    if (line.trim() === "") return { type: "blank" };
+    return { type: "text", text: line.trim() };
+  });
+
+  const out = [];
+  const last = () => out[out.length - 1];
+  const pushBlank = () => { if (out.length && last() !== "") out.push(""); };
+  for (const item of parsed) {
+    if (item.type === "blank") { pushBlank(); continue; }
+    if (item.type === "num") {
+      if (out.length) pushBlank(); // one blank line as a separator before each numbered point
+      out.push(item.text);
+      continue;
+    }
+    if (item.type === "bullet") {
+      if (out.length && last() === "") out.pop(); // sub-bullets hug the point above (compact)
+      out.push(item.text);
+      continue;
+    }
+    out.push(item.text);
+  }
+  while (out.length && out[0] === "") out.shift();
+  while (out.length && last() === "") out.pop();
+  return out.join("\n");
 }
 
 function normalizeJid(phone) {
