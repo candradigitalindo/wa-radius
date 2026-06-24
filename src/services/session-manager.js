@@ -823,7 +823,10 @@ function toWhatsAppMarkup(text) {
   // Classify each line, stripping Markdown indentation (which renders as ragged
   // leading spaces on WhatsApp) and unifying bullet markers to "- ".
   const parsed = t.split("\n").map((line) => {
-    const bullet = line.match(/^[ \t]*[-*+][ \t]+(.*)$/); // "- ", "* ", "+ " (needs space → won't catch *bold*)
+    // Bullets use "- "/"+ " only. We deliberately exclude "* " as a bullet marker: a
+    // centered/decorative line like "*  CODE  *" (bold-wrap) would otherwise be mistaken
+    // for a bullet and rendered as "• CODE *" on WhatsApp.
+    const bullet = line.match(/^[ \t]*[-+][ \t]+(.*)$/);
     if (bullet) return { type: "bullet", text: "- " + bullet[1].trim() };
     const num = line.match(/^[ \t]*(\d+)\.[ \t]+(.*)$/); // "1. ", "2. " …
     if (num) return { type: "num", text: num[1] + ". " + num[2].trim() };
