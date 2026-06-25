@@ -985,9 +985,48 @@ const staleCleanupInterval = setInterval(async () => {
   }
 }, 15000); // Check every 15 seconds
 
+// Periodic auto-revive: reconnect sessions that still have stored credentials but are
+// not currently alive. Covers the case where WhatsApp transiently rejected the connection
+// (e.g. statusCode 405) and the retry budget + stale watchdog gave up — without this, such
+// a session would stay dead until a manual /start or a container restart (which is exactly
+// how the CS-bot superadmin session went silently offline). Credentials are reused, so no
+// QR re-scan. Tenants that were logged out / banned have their creds deleted, so they are
+// not listed here and won't be revived.
+const REVIVE_INTERVAL_MS = 3 * 60 * 1000; // every 3 minutes
+const ALIVE_STATUSES = new Set(["connected", "connecting", "reconnecting", "qr"]);
+let reviveRunning = false;
+const reviveInterval = setInterval(async () => {
+  if (reviveRunning) return;
+  reviveRunning = true;
+  try {
+    const tenantIds = await getAllTenantIds(); // only tenants with stored credentials
+    for (const tenantId of tenantIds) {
+      const session = sessions.get(tenantId);
+      if (session && ALIVE_STATUSES.has(session.status)) continue; // healthy or mid-attempt
+      if (session && session.intentionallyClosed) continue; // someone stopped it on purpose
+
+      logger.info(
+        { tenant: tenantId, prevStatus: session ? session.status : "none" },
+        "Auto-reviving session (has credentials but not connected)"
+      );
+      try {
+        await startSession(tenantId);
+      } catch (err) {
+        logger.error({ tenant: tenantId, err: err.message }, "Auto-revive failed");
+      }
+      await sleep(3000); // stagger reconnects to avoid WA/IP throttling
+    }
+  } catch (err) {
+    logger.error({ err: err.message }, "Session reviver error");
+  } finally {
+    reviveRunning = false;
+  }
+}, REVIVE_INTERVAL_MS);
+
 // Gracefully close all active Baileys sockets (called on SIGTERM/SIGINT)
 async function gracefulShutdown() {
   clearInterval(staleCleanupInterval);
+  clearInterval(reviveInterval);
   const tenantIds = [...sessions.keys()];
   logger.info({ count: tenantIds.length }, "Gracefully closing all sessions");
   for (const tenantId of tenantIds) {
