@@ -43,6 +43,13 @@ function extractText(message) {
   );
 }
 
+// Per-sender rate limit to cap AI cost / abuse: max N messages per window.
+// In-memory sliding window (reset on restart — fine for a short window).
+const RATE_MAX = Number(process.env.N8N_RATE_MAX || 20);
+const RATE_WINDOW_MS = Number(process.env.N8N_RATE_WINDOW_MS || 600000); // 10 menit
+const rateHits = new Map(); // jid -> [timestamps]
+const rateNotified = new Map(); // jid -> last notify ts
+
 // Forward one incoming message to the n8n webhook (fire-and-forget).
 async function forwardToN8n(tenantId, msg) {
   try {
@@ -67,6 +74,24 @@ async function forwardToN8n(tenantId, msg) {
       logger.debug({ tenant: tenantId }, "skipped trivial message (no AI call)");
       return;
     }
+
+    // Rate limit per sender — block spam/abuse from running up AI cost.
+    const nowTs = Date.now();
+    const hits = (rateHits.get(jid) || []).filter((t) => nowTs - t < RATE_WINDOW_MS);
+    if (hits.length >= RATE_MAX) {
+      rateHits.set(jid, hits);
+      logger.warn({ tenant: tenantId, jid, hits: hits.length }, "rate limit hit — skip n8n forward");
+      const lastN = rateNotified.get(jid) || 0;
+      if (nowTs - lastN > RATE_WINDOW_MS) {
+        rateNotified.set(jid, nowTs);
+        try {
+          await sendMessage(tenantId, jid, "Maaf, pesan Anda terlalu banyak dalam waktu singkat 🙏 Mohon tunggu beberapa menit ya, nanti saya bantu lagi.");
+        } catch (e) {}
+      }
+      return;
+    }
+    hits.push(nowTs);
+    rateHits.set(jid, hits);
 
     // WhatsApp may address senders by a privacy LID ("…@lid") instead of the real
     // phone JID. For tenant lookup we need the real phone number (PN): prefer the
