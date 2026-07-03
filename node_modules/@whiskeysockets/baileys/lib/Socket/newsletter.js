@@ -1,6 +1,7 @@
 import { QueryIds, XWAPaths } from '../Types/index.js';
 import { generateProfilePicture } from '../Utils/messages-media.js';
 import { getBinaryNodeChild } from '../WABinary/index.js';
+import { makeGroupsSocket } from './groups.js';
 import { executeWMexQuery as genericExecuteWMexQuery } from './mex.js';
 const parseNewsletterCreateResponse = (response) => {
     const { id, thread_metadata: thread, viewer_metadata: viewer } = response;
@@ -32,7 +33,8 @@ const parseNewsletterMetadata = (result) => {
     }
     return null;
 };
-export const makeNewsletterSocket = (sock) => {
+export const makeNewsletterSocket = (config) => {
+    const sock = makeGroupsSocket(config);
     const { query, generateMessageTag } = sock;
     const executeWMexQuery = (variables, queryId, dataPath) => {
         return genericExecuteWMexQuery(variables, queryId, dataPath, query, generateMessageTag);
@@ -77,10 +79,10 @@ export const makeNewsletterSocket = (sock) => {
             return parseNewsletterMetadata(result);
         },
         newsletterFollow: (jid) => {
-            return executeWMexQuery({ newsletter_id: jid }, QueryIds.FOLLOW, XWAPaths.xwa2_newsletter_follow);
+            return executeWMexQuery({ newsletter_id: jid }, QueryIds.FOLLOW, XWAPaths.xwa2_newsletter_join_v2);
         },
         newsletterUnfollow: (jid) => {
-            return executeWMexQuery({ newsletter_id: jid }, QueryIds.UNFOLLOW, XWAPaths.xwa2_newsletter_unfollow);
+            return executeWMexQuery({ newsletter_id: jid }, QueryIds.UNFOLLOW, XWAPaths.xwa2_newsletter_leave_v2);
         },
         newsletterMute: (jid) => {
             return executeWMexQuery({ newsletter_id: jid }, QueryIds.MUTE, XWAPaths.xwa2_newsletter_mute_v2);

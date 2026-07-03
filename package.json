@@ -8,7 +8,7 @@
     "dev": "nodemon src/index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.16",
+    "@whiskeysockets/baileys": "7.0.0-rc13",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "link-preview-js": "^3.0.0",

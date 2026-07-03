@@ -1,5 +1,6 @@
 import type { proto } from '../../WAProto/index.js';
 import type { AccountSettings } from './Auth.js';
+import type { QuickReplyAction } from './Bussines.js';
 import type { BufferedEventData } from './Events.js';
 import type { LabelActionBody } from './Label.js';
 import type { ChatLabelAssociationActionBody } from './LabelAssociation.js';
@@ -19,6 +20,7 @@ export type WAPatchName = (typeof ALL_WA_PATCH_NAMES)[number];
 export interface PresenceData {
     lastKnownPresence: WAPresence;
     lastSeen?: number;
+    groupOnlineCount?: number;
 }
 export type BotListInfo = {
     jid: string;
@@ -50,6 +52,8 @@ export type ChatUpdate = Partial<Chat & {
      * undefined if the condition is not yet fulfilled
      * */
     conditional: (bufferedData: BufferedEventData) => boolean | undefined;
+    /** last update time */
+    timestamp?: number;
 }>;
 /**
  * the last messages in a chat, sorted reverse-chronologically. That is, the latest message should be first in the chat
@@ -103,6 +107,8 @@ export type ChatModification = {
     addMessageLabel: MessageLabelAssociationActionBody;
 } | {
     removeMessageLabel: MessageLabelAssociationActionBody;
+} | {
+    quickReply: QuickReplyAction;
 };
 export type InitialReceivedChatsState = {
     [jid: string]: {

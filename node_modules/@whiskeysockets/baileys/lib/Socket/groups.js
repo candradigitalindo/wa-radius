@@ -1,7 +1,8 @@
+import { Boom } from '@hapi/boom';
 import { proto } from '../../WAProto/index.js';
-import { WAMessageStubType } from '../Types/index.js';
+import { WAMessageAddressingMode, WAMessageStubType } from '../Types/index.js';
 import { generateMessageIDV2, unixTimestampSeconds } from '../Utils/index.js';
-import { getBinaryNodeChild, getBinaryNodeChildren, getBinaryNodeChildString, isJidUser, isLidUser, jidEncode, jidNormalizedUser } from '../WABinary/index.js';
+import { getBinaryNodeChild, getBinaryNodeChildren, getBinaryNodeChildString, isLidUser, isPnUser, jidEncode, jidNormalizedUser } from '../WABinary/index.js';
 import { makeChatsSocket } from './chats.js';
 export const makeGroupsSocket = (config) => {
     const sock = makeChatsSocket(config);
@@ -51,6 +52,7 @@ export const makeGroupsSocket = (config) => {
                 data[meta.id] = meta;
             }
         }
+        // TODO: properly parse LID / PN DATA
         sock.ev.emit('groups.update', Object.values(data));
         return data;
     };
@@ -237,7 +239,7 @@ export const makeGroupsSocket = (config) => {
                     participant: key.remoteJid
                 },
                 messageStubType: WAMessageStubType.GROUP_PARTICIPANT_ADD,
-                messageStubParameters: [authState.creds.me.id],
+                messageStubParameters: [JSON.stringify(authState.creds.me)],
                 participant: key.remoteJid,
                 messageTimestamp: unixTimestampSeconds()
             }, 'notify');
@@ -269,16 +271,31 @@ export const makeGroupsSocket = (config) => {
 };
 export const extractGroupMetadata = (result) => {
     const group = getBinaryNodeChild(result, 'group');
+    if (!group) {
+        // Mirror WAWeb: surface server/client errors with their code+text instead of crashing.
+        const errorNode = getBinaryNodeChild(result, 'error');
+        if (errorNode) {
+            const code = errorNode.attrs.code ? +errorNode.attrs.code : 500;
+            const text = errorNode.attrs.text || 'group metadata query failed';
+            throw new Boom(text, { statusCode: code, data: errorNode });
+        }
+        throw new Boom('Invalid group metadata response: missing <group> node', { data: result });
+    }
+    if (!group.attrs.id) {
+        throw new Boom('Invalid group metadata response: missing group id', { data: group });
+    }
     const descChild = getBinaryNodeChild(group, 'description');
     let desc;
     let descId;
     let descOwner;
-    let descOwnerJid;
+    let descOwnerPn;
+    let descOwnerUsername;
     let descTime;
     if (descChild) {
         desc = getBinaryNodeChildString(descChild, 'body');
         descOwner = descChild.attrs.participant ? jidNormalizedUser(descChild.attrs.participant) : undefined;
-        descOwnerJid = descChild.attrs.participant_pn ? jidNormalizedUser(descChild.attrs.participant_pn) : undefined;
+        descOwnerPn = descChild.attrs.participant_pn ? jidNormalizedUser(descChild.attrs.participant_pn) : undefined;
+        descOwnerUsername = descChild.attrs.participant_username || undefined;
         descTime = +descChild.attrs.t;
         descId = descChild.attrs.id;
     }
@@ -287,20 +304,24 @@ export const extractGroupMetadata = (result) => {
     const memberAddMode = getBinaryNodeChildString(group, 'member_add_mode') === 'all_member_add';
     const metadata = {
         id: groupId,
-        addressingMode: group.attrs.addressing_mode,
+        notify: group.attrs.notify,
+        addressingMode: group.attrs.addressing_mode === 'lid' ? WAMessageAddressingMode.LID : WAMessageAddressingMode.PN,
         subject: group.attrs.subject,
         subjectOwner: group.attrs.s_o,
-        subjectOwnerJid: group.attrs.s_o_pn,
+        subjectOwnerPn: group.attrs.s_o_pn,
+        subjectOwnerUsername: group.attrs.s_o_username,
         subjectTime: +group.attrs.s_t,
         size: group.attrs.size ? +group.attrs.size : getBinaryNodeChildren(group, 'participant').length,
         creation: +group.attrs.creation,
         owner: group.attrs.creator ? jidNormalizedUser(group.attrs.creator) : undefined,
-        ownerJid: group.attrs.creator_pn ? jidNormalizedUser(group.attrs.creator_pn) : undefined,
+        ownerPn: group.attrs.creator_pn ? jidNormalizedUser(group.attrs.creator_pn) : undefined,
+        ownerUsername: group.attrs.creator_username || undefined,
         owner_country_code: group.attrs.creator_country_code,
         desc,
         descId,
         descOwner,
-        descOwnerJid,
+        descOwnerPn,
+        descOwnerUsername,
         descTime,
         linkedParent: getBinaryNodeChild(group, 'linked_parent')?.attrs.jid || undefined,
         restrict: !!getBinaryNodeChild(group, 'locked'),
@@ -310,10 +331,12 @@ export const extractGroupMetadata = (result) => {
         joinApprovalMode: !!getBinaryNodeChild(group, 'membership_approval_mode'),
         memberAddMode,
         participants: getBinaryNodeChildren(group, 'participant').map(({ attrs }) => {
+            // TODO: Store LID MAPPINGS
             return {
                 id: attrs.jid,
-                jid: isJidUser(attrs.jid) ? attrs.jid : jidNormalizedUser(attrs.phone_number),
-                lid: isLidUser(attrs.jid) ? attrs.jid : attrs.lid,
+                phoneNumber: isLidUser(attrs.jid) && isPnUser(attrs.phone_number) ? attrs.phone_number : undefined,
+                lid: isPnUser(attrs.jid) && isLidUser(attrs.lid) ? attrs.lid : undefined,
+                username: attrs.participant_username || attrs.username || undefined,
                 admin: (attrs.type || null)
             };
         }),

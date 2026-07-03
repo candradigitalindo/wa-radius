@@ -213,13 +213,13 @@ async function startSession(tenantId) {
         keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
       },
       logger: baileysLogger,
-      printQRInTerminal: false,
       generateHighQualityLinkPreview: false,
       markOnlineOnConnect: false,
+      // Keep history small but DO allow the initial history sync: Baileys 7 delivers
+      // the initial LID mappings through it, and blocking it (shouldSyncHistoryMessage
+      // => false) causes "No session record" decrypt failures on @lid senders.
       syncFullHistory: false,
-      shouldSyncHistoryMessage: () => false,
       connectTimeoutMs: 60000,
-      qrTimeout: 60000,
       defaultQueryTimeoutMs: 60000,
       browser: Browsers.macOS("Desktop"),
       keepAliveIntervalMs: 30000,

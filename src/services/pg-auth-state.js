@@ -68,6 +68,9 @@ async function usePgAuthState(tenantId) {
         const rawData = typeof row.key_data === "string"
           ? JSON.parse(row.key_data)
           : row.key_data;
+        // Skip literal-null rows left behind before set() honoured deletes —
+        // libsignal must see "no record", not a null record.
+        if (rawData === null || rawData === undefined) continue;
         data[row.key_id] = fixBuffers(rawData);
       }
       return data;
@@ -88,6 +91,17 @@ async function usePgAuthState(tenantId) {
         await client.query("BEGIN");
 
         for (const op of operations) {
+          // Baileys deletes a key by setting it to null/undefined (e.g. when the
+          // signal repository migrates a PN session to its LID identity). Upserting
+          // a literal "null" here would make get() hand libsignal a null session
+          // record instead of "no record" — so honour the delete.
+          if (op.value === null || op.value === undefined) {
+            await client.query(
+              "DELETE FROM wa_auth_keys WHERE tenant_id = $1 AND key_type = $2 AND key_id = $3",
+              [tenantId, op.type, op.id]
+            );
+            continue;
+          }
           await client.query(
             `INSERT INTO wa_auth_keys (tenant_id, key_type, key_id, key_data, updated_at)
              VALUES ($1, $2, $3, $4, NOW())

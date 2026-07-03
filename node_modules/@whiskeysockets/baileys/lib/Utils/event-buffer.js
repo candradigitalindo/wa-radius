@@ -1,5 +1,4 @@
 import EventEmitter from 'events';
-import { proto } from '../../WAProto/index.js';
 import { WAMessageStatus } from '../Types/index.js';
 import { trimUndefined } from './generics.js';
 import { updateMessageWithReaction, updateMessageWithReceipt } from './messages.js';
@@ -22,13 +21,17 @@ const BUFFERABLE_EVENT_SET = new Set(BUFFERABLE_EVENT);
 /**
  * The event buffer logically consolidates different events into a single event
  * making the data processing more efficient.
- * @param ev the baileys event emitter
  */
 export const makeEventBuffer = (logger) => {
     const ev = new EventEmitter();
     const historyCache = new Set();
     let data = makeBufferData();
     let isBuffering = false;
+    let bufferTimeout = null;
+    let flushPendingTimeout = null; // Add a specific timer for the debounced flush to prevent leak
+    let bufferCount = 0;
+    const MAX_HISTORY_CACHE_SIZE = 10000; // Limit the history cache size to prevent memory bloat
+    const BUFFER_TIMEOUT_MS = 30000; // 30 seconds
     // take the generic event and fire it as a baileys event
     ev.on('event', (map) => {
         for (const event in map) {
@@ -39,14 +42,41 @@ export const makeEventBuffer = (logger) => {
         if (!isBuffering) {
             logger.debug('Event buffer activated');
             isBuffering = true;
+            bufferCount = 0;
+            if (bufferTimeout) {
+                clearTimeout(bufferTimeout);
+            }
+            bufferTimeout = setTimeout(() => {
+                if (isBuffering) {
+                    logger.warn('Buffer timeout reached, auto-flushing');
+                    flush();
+                }
+            }, BUFFER_TIMEOUT_MS);
         }
+        // Always increment count when requested
+        bufferCount++;
     }
     function flush() {
         if (!isBuffering) {
             return false;
         }
-        logger.debug('Flushing event buffer');
+        logger.debug({ bufferCount }, 'Flushing event buffer');
         isBuffering = false;
+        bufferCount = 0;
+        // Clear timeout
+        if (bufferTimeout) {
+            clearTimeout(bufferTimeout);
+            bufferTimeout = null;
+        }
+        if (flushPendingTimeout) {
+            clearTimeout(flushPendingTimeout);
+            flushPendingTimeout = null;
+        }
+        // Clear history cache if it exceeds the max size
+        if (historyCache.size > MAX_HISTORY_CACHE_SIZE) {
+            logger.debug({ cacheSize: historyCache.size }, 'Clearing history cache');
+            historyCache.clear();
+        }
         const newData = makeBufferData();
         const chatUpdates = Object.values(data.chatUpdates);
         let conditionalChatUpdatesLeft = 0;
@@ -67,8 +97,8 @@ export const makeEventBuffer = (logger) => {
     }
     return {
         process(handler) {
-            const listener = (map) => {
-                handler(map);
+            const listener = async (map) => {
+                await handler(map);
             };
             ev.on('event', listener);
             return () => {
@@ -76,6 +106,27 @@ export const makeEventBuffer = (logger) => {
             };
         },
         emit(event, evData) {
+            // Check if this is a messages.upsert with a different type than what's buffered
+            // If so, flush the buffered messages first to avoid type overshadowing
+            if (event === 'messages.upsert') {
+                const { type } = evData;
+                const existingUpserts = Object.values(data.messageUpserts);
+                if (existingUpserts.length > 0) {
+                    const bufferedType = existingUpserts[0].type;
+                    if (bufferedType !== type) {
+                        logger.debug({ bufferedType, newType: type }, 'messages.upsert type mismatch, emitting buffered messages');
+                        // Emit the buffered messages with their correct type
+                        ev.emit('event', {
+                            'messages.upsert': {
+                                messages: existingUpserts.map(m => m.message),
+                                type: bufferedType
+                            }
+                        });
+                        // Clear the message upserts from the buffer
+                        data.messageUpserts = {};
+                    }
+                }
+            }
             if (isBuffering && BUFFERABLE_EVENT_SET.has(event)) {
                 append(data, historyCache, event, evData, logger);
                 return true;
@@ -91,16 +142,54 @@ export const makeEventBuffer = (logger) => {
             return async (...args) => {
                 buffer();
                 try {
-                    return await work(...args);
+                    const result = await work(...args);
+                    // If this is the only buffer, flush after a small delay
+                    if (bufferCount === 1) {
+                        setTimeout(() => {
+                            if (isBuffering && bufferCount === 1) {
+                                flush();
+                            }
+                        }, 100); // Small delay to allow nested buffers
+                    }
+                    return result;
+                }
+                catch (error) {
+                    throw error;
                 }
                 finally {
-                    // Flushing is now controlled centrally by the state machine.
+                    bufferCount = Math.max(0, bufferCount - 1);
+                    if (bufferCount === 0) {
+                        // Only schedule ONE timeout, not 10,000
+                        if (!flushPendingTimeout) {
+                            flushPendingTimeout = setTimeout(flush, 100);
+                        }
+                    }
                 }
             };
         },
         on: (...args) => ev.on(...args),
         off: (...args) => ev.off(...args),
-        removeAllListeners: (...args) => ev.removeAllListeners(...args)
+        removeAllListeners: (...args) => ev.removeAllListeners(...args),
+        destroy() {
+            // Clear buffer timeout
+            if (bufferTimeout) {
+                clearTimeout(bufferTimeout);
+                bufferTimeout = null;
+            }
+            if (flushPendingTimeout) {
+                clearTimeout(flushPendingTimeout);
+                flushPendingTimeout = null;
+            }
+            // Clear history cache
+            historyCache.clear();
+            // Reset buffer data
+            data = makeBufferData();
+            isBuffering = false;
+            bufferCount = 0;
+            // Remove all listeners
+            ev.removeAllListeners();
+            logger.debug('Event buffer destroyed');
+        }
     };
 };
 const makeBufferData = () => {
@@ -131,13 +220,14 @@ eventData, logger) {
     switch (event) {
         case 'messaging-history.set':
             for (const chat of eventData.chats) {
-                const existingChat = data.historySets.chats[chat.id];
+                const id = chat.id || '';
+                const existingChat = data.historySets.chats[id];
                 if (existingChat) {
                     existingChat.endOfHistoryTransferType = chat.endOfHistoryTransferType;
                 }
-                if (!existingChat && !historyCache.has(chat.id)) {
-                    data.historySets.chats[chat.id] = chat;
-                    historyCache.add(chat.id);
+                if (!existingChat && !historyCache.has(id)) {
+                    data.historySets.chats[id] = chat;
+                    historyCache.add(id);
                     absorbingChatUpdate(chat);
                 }
             }
@@ -165,17 +255,44 @@ eventData, logger) {
             }
             data.historySets.empty = false;
             data.historySets.syncType = eventData.syncType;
+            if (eventData.pastParticipants?.length) {
+                const merged = new Map();
+                const sigOf = (p) => `${p.userJid || ''}:${p.leaveTs || ''}:${p.leaveReason || ''}`;
+                const ingest = (entry) => {
+                    const key = entry.groupJid ?? JSON.stringify(entry);
+                    const existing = merged.get(key);
+                    if (!existing) {
+                        merged.set(key, { ...entry, pastParticipants: [...(entry.pastParticipants || [])] });
+                        return;
+                    }
+                    const seen = new Set((existing.pastParticipants || []).map(sigOf));
+                    for (const p of entry.pastParticipants || []) {
+                        const sig = sigOf(p);
+                        if (!seen.has(sig)) {
+                            existing.pastParticipants.push(p);
+                            seen.add(sig);
+                        }
+                    }
+                };
+                for (const entry of data.historySets.pastParticipants || [])
+                    ingest(entry);
+                for (const entry of eventData.pastParticipants)
+                    ingest(entry);
+                data.historySets.pastParticipants = [...merged.values()];
+            }
             data.historySets.progress = eventData.progress;
+            data.historySets.chunkOrder = eventData.chunkOrder;
             data.historySets.peerDataRequestSessionId = eventData.peerDataRequestSessionId;
             data.historySets.isLatest = eventData.isLatest || data.historySets.isLatest;
             break;
         case 'chats.upsert':
             for (const chat of eventData) {
-                let upsert = data.chatUpserts[chat.id];
-                if (!upsert) {
-                    upsert = data.historySets.chats[chat.id];
+                const id = chat.id || '';
+                let upsert = data.chatUpserts[id];
+                if (id && !upsert) {
+                    upsert = data.historySets.chats[id];
                     if (upsert) {
-                        logger.debug({ chatId: chat.id }, 'absorbed chat upsert in chat set');
+                        logger.debug({ chatId: id }, 'absorbed chat upsert in chat set');
                     }
                 }
                 if (upsert) {
@@ -183,11 +300,11 @@ eventData, logger) {
                 }
                 else {
                     upsert = chat;
-                    data.chatUpserts[chat.id] = upsert;
+                    data.chatUpserts[id] = upsert;
                 }
                 absorbingChatUpdate(upsert);
-                if (data.chatDeletes.has(chat.id)) {
-                    data.chatDeletes.delete(chat.id);
+                if (data.chatDeletes.has(id)) {
+                    data.chatDeletes.delete(id);
                 }
             }
             break;
@@ -389,7 +506,7 @@ eventData, logger) {
             throw new Error(`"${event}" cannot be buffered`);
     }
     function absorbingChatUpdate(existing) {
-        const chatId = existing.id;
+        const chatId = existing.id || '';
         const update = data.chatUpdates[chatId];
         if (update) {
             const conditionMatches = update.conditional ? update.conditional(data) : true;
@@ -410,7 +527,7 @@ eventData, logger) {
         // if the message has already been marked read by us
         const chatId = message.key.remoteJid;
         const chat = data.chatUpdates[chatId] || data.chatUpserts[chatId];
-        if (isRealMessage(message, '') &&
+        if (isRealMessage(message) &&
             shouldIncrementChatUnread(message) &&
             typeof chat?.unreadCount === 'number' &&
             chat.unreadCount > 0) {
@@ -429,9 +546,11 @@ function consolidateEvents(data) {
             chats: Object.values(data.historySets.chats),
             messages: Object.values(data.historySets.messages),
             contacts: Object.values(data.historySets.contacts),
+            pastParticipants: data.historySets.pastParticipants,
             syncType: data.historySets.syncType,
             progress: data.historySets.progress,
             isLatest: data.historySets.isLatest,
+            chunkOrder: data.historySets.chunkOrder,
             peerDataRequestSessionId: data.historySets.peerDataRequestSessionId
         };
     }
