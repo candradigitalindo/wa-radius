@@ -50,16 +50,76 @@ const RATE_WINDOW_MS = Number(process.env.N8N_RATE_WINDOW_MS || 600000); // 10 m
 const rateHits = new Map(); // jid -> [timestamps]
 const rateNotified = new Map(); // jid -> last notify ts
 
+// Operator takeover: a manual reply from the owner's phone/WA Web (fromMe not sent
+// through our API) silences the bot for that chat, so it never talks over a human
+// conversation the owner is having (or has started) with that contact.
+const BOT_PAUSE_AFTER_MANUAL_MS = Number(process.env.BOT_PAUSE_AFTER_MANUAL_MS || 43200000); // 12 jam
+const operatorPausedUntil = new Map(); // "tenantId|jid" -> paused-until ts
+// Messages sent through our API (bot replies, notifications). Used to tell them
+// apart from manual sends. jid marker closes the race where Baileys emits the
+// upsert before sendMessage() resolves with the message id.
+const apiSentIds = new Map(); // message id -> ts
+const apiRecentJids = new Map(); // jid -> ts of last API send attempt
+const API_SENT_TTL_MS = 3600000;
+const API_JID_GRACE_MS = 15000;
+
+function rememberApiSend(jid, id) {
+  const now = Date.now();
+  if (jid) apiRecentJids.set(jid, now);
+  if (id) apiSentIds.set(id, now);
+  if (apiSentIds.size > 2000) {
+    for (const [k, t] of apiSentIds) if (now - t > API_SENT_TTL_MS) apiSentIds.delete(k);
+  }
+}
+
+// Canned phrases of other CS/auto-reply systems. Answering them would start a
+// bot-to-bot loop, so those inbound messages are dropped before the AI call.
+const AUTO_REPLY_PATTERNS = [
+  /terima\s*kasih\s*(sudah|telah)\s*menghubungi/i,
+  /menghubungkan\s+anda\s+dengan\s+tim/i,
+  /balasan\s+otomatis|pesan\s+otomatis|auto\s*-?\s*reply/i,
+  /di\s*luar\s+jam\s+(operasional|kerja)/i,
+];
+
+// Identical message repeated within this window → skip (dedupe).
+const DEDUPE_WINDOW_MS = Number(process.env.N8N_DEDUPE_WINDOW_MS || 600000); // 10 menit
+const lastInbound = new Map(); // jid -> { norm, ts }
+
 // Forward one incoming message to the n8n webhook (fire-and-forget).
 async function forwardToN8n(tenantId, msg) {
   try {
     const jid = msg.key?.remoteJid || "";
-    // Skip own messages, status broadcasts, and groups (CS is 1:1 with tenants).
-    if (msg.key?.fromMe) return;
+    // Own messages: sent via our API (arrive as type "append", plus id/jid markers)
+    // → ignore; anything else fromMe is the owner typing manually from phone/WA Web
+    // → pause the bot for this chat (human takeover), then ignore.
+    if (msg.key?.fromMe) {
+      if (jid && jid !== "status@broadcast" && !jid.endsWith("@g.us")) {
+        const apiJidTs = apiRecentJids.get(jid) || 0;
+        const viaApi = apiSentIds.has(msg.key?.id) || Date.now() - apiJidTs < API_JID_GRACE_MS;
+        if (!viaApi) {
+          operatorPausedUntil.set(`${tenantId}|${jid}`, Date.now() + BOT_PAUSE_AFTER_MANUAL_MS);
+          logger.info({ tenant: tenantId, jid }, "manual reply detected — bot paused for this chat");
+        }
+      }
+      return;
+    }
     if (jid === "status@broadcast" || jid.endsWith("@g.us")) return;
+
+    // Human has taken over this chat recently → stay silent.
+    const pausedUntil = operatorPausedUntil.get(`${tenantId}|${jid}`) || 0;
+    if (pausedUntil > Date.now()) {
+      logger.info({ tenant: tenantId, jid }, "bot paused (manual takeover) — skip n8n forward");
+      return;
+    }
 
     const text = extractText(msg.message).trim();
     if (!text) return; // ignore media-only / reactions / system events
+
+    // Auto-reply from another CS system → never answer (bot-to-bot loop).
+    if (AUTO_REPLY_PATTERNS.some((re) => re.test(text))) {
+      logger.info({ tenant: tenantId, jid }, "auto-reply pattern detected — skip n8n forward");
+      return;
+    }
 
     // Skip trivial acknowledgements/emoji-only so they don't trigger an (paid)
     // AI reply. Normalize: lowercase, strip punctuation/emoji/spaces.
@@ -74,6 +134,16 @@ async function forwardToN8n(tenantId, msg) {
       logger.debug({ tenant: tenantId }, "skipped trivial message (no AI call)");
       return;
     }
+
+    // Same message repeated shortly after → answer once, skip the repeats.
+    const prev = lastInbound.get(jid);
+    const dedupeNow = Date.now();
+    if (prev && prev.norm === norm && dedupeNow - prev.ts < DEDUPE_WINDOW_MS) {
+      prev.ts = dedupeNow;
+      logger.info({ tenant: tenantId, jid }, "duplicate message — skip n8n forward");
+      return;
+    }
+    lastInbound.set(jid, { norm, ts: dedupeNow });
 
     // Rate limit per sender — block spam/abuse from running up AI cost.
     const nowTs = Date.now();
@@ -517,7 +587,9 @@ async function sendMessage(tenantId, phone, message, options = {}) {
     }
   }
 
+  rememberApiSend(jid, null); // mark before sending: upsert event may fire before we get the id
   const result = await session.socket.sendMessage(jid, messageContent);
+  rememberApiSend(jid, result?.key?.id);
 
   // Increment daily send count for single messages (broadcast handles its own counting)
   if (!options._skipLimitCheck) {
